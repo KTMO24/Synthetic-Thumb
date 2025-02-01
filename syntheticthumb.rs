@@ -1,23 +1,31 @@
 // src/main.rs
 
-//! This example provides two modes:
-//! 1. Running as a FUSE filesystem (the synthetic thumb drive)
+//! This merged example provides three modes:
+//!
+//! 1. Running as a FUSE filesystem (the synthetic thumb drive).
 //!    Usage: synthetic_thumb <mountpoint>
-//! 2. Running with a PySide6 GUI for settings:
+//!
+//! 2. Running with a PySide6 GUI for settings.
 //!    Usage: synthetic_thumb gui
+//!
+//! 3. Running a simulation that uses multi‑threading, statistical range
+//!    compression, and a dual‑waveform timelock loop.
+//!    Usage: synthetic_thumb simulate
 
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use fuse::{Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyOpen, ReplyWrite, Request};
 use libc::{ENOENT, S_IFDIR, S_IFREG};
 use pyo3::prelude::*;
+use std::f64::consts::PI;
 
 // A short TTL for cached attributes.
 const TTL: Duration = Duration::from_secs(1);
@@ -353,27 +361,192 @@ if __name__ == '__main__':
     })
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    // If the argument "gui" is given, run the PySide6 GUI.
-    if args.len() > 1 && args[1] == "gui" {
-        if let Err(e) = launch_gui() {
-            eprintln!("Failed to launch GUI: {:?}", e);
+// --- Waveform and Vector Processing Simulation ---
+//
+// The following functions demonstrate multi‑threading,
+// statistical range compression, vector serialization, and a dual‑waveform
+// timelock “analog” loop that adjusts a time dilation factor based on
+// sine vs. sawtooth waveforms.
+
+/// Generate analog-like waveforms (sine and sawtooth) on a separate thread.
+///
+/// Every cycle it computes:
+///   - a sine value: sin(2πft)
+///   - a sawtooth value: a linear ramp from –1 to 1 each period
+///   - an “offset” computed from the difference (and its inverse phase)
+///
+/// The values are sent over a channel.
+fn generate_waveforms(sender: mpsc::Sender<(f64, f64, f64)>) {
+    let start = Instant::now();
+    let frequency = 1.0; // 1 Hz waveforms
+    loop {
+        let t = start.elapsed().as_secs_f64();
+        let sin_val = (2.0 * PI * frequency * t).sin();
+        let saw_val = 2.0 * ((t * frequency) - (t * frequency).floor()) - 1.0;
+        let inv_phase = -sin_val;
+        // Compute an "offset" as a function of phase difference.
+        let offset = (sin_val - saw_val + inv_phase) / 3.0;
+        if sender.send((sin_val, saw_val, offset)).is_err() {
+            break;
         }
-        return;
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Serialize a vector of f64 values by first performing a statistical range
+/// compression (normalizing to 0..255) and then converting to a Vec<u8>.
+fn serialize_vector(vec: &[f64]) -> Vec<u8> {
+    let min = vec.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = vec.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let range = max - min;
+    vec.iter()
+        .map(|&v| {
+            if range > 0.0 {
+                (((v - min) / range) * 255.0).round() as u8
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// Process (serialize) a large vector by splitting it into chunks and
+/// processing them in parallel using threads.
+fn process_vector(vec: Vec<f64>) -> Vec<u8> {
+    let chunk_size = 1000;
+    let chunks: Vec<&[f64]> = vec.chunks(chunk_size).collect();
+    let (tx, rx) = mpsc::channel();
+    let mut handles = Vec::new();
+
+    for chunk in chunks {
+        let tx = tx.clone();
+        let chunk_vec = chunk.to_vec();
+        let handle = thread::spawn(move || {
+            let serialized = serialize_vector(&chunk_vec);
+            tx.send(serialized).expect("Failed to send serialized chunk");
+        });
+        handles.push(handle);
+    }
+    drop(tx);
+    let mut result = Vec::new();
+    for serialized_chunk in rx {
+        result.extend(serialized_chunk);
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    result
+}
+
+/// A dual‑waveform timelock “analog” processing loop structure.
+///
+/// This structure gathers waveform offset values, adjusts a time dilation
+/// factor based on the phase relationship of sine and sawtooth, and computes
+/// a “future offset” based on historical data.
+struct DualWaveformTimelock {
+    offsets: Vec<f64>,
+    time_dilation: f64,
+}
+
+impl DualWaveformTimelock {
+    fn new() -> Self {
+        Self {
+            offsets: Vec::new(),
+            time_dilation: 1.0,
+        }
     }
 
-    // Otherwise, assume FUSE mount mode.
+    /// Process new waveform values. Adjust the time dilation based on
+    /// whether the sine value exceeds the sawtooth value.
+    fn process(&mut self, sin_val: f64, saw_val: f64, offset: f64) {
+        if sin_val > saw_val {
+            self.time_dilation *= 1.01;
+        } else {
+            self.time_dilation *= 0.99;
+        }
+        self.offsets.push(offset * self.time_dilation);
+        if self.offsets.len() > 100 {
+            self.offsets.remove(0);
+        }
+    }
+
+    /// Compute a future offset prediction (here as a simple average).
+    fn future_offset(&self) -> f64 {
+        if self.offsets.is_empty() {
+            0.0
+        } else {
+            self.offsets.iter().sum::<f64>() / (self.offsets.len() as f64)
+        }
+    }
+}
+
+/// Run the waveform simulation and vector processing demo.
+fn run_simulation() {
+    let (wave_tx, wave_rx) = mpsc::channel::<(f64, f64, f64)>();
+
+    let waveform_thread = thread::spawn(move || {
+        generate_waveforms(wave_tx);
+    });
+
+    let vector_thread = thread::spawn(|| {
+        let large_vec: Vec<f64> = (0..10_000)
+            .map(|x| ((x as f64) * 0.001).sin() * 100.0)
+            .collect();
+        let serialized = process_vector(large_vec);
+        println!("Serialized vector length: {}", serialized.len());
+    });
+
+    let mut timelock = DualWaveformTimelock::new();
+    for (sin_val, saw_val, offset) in wave_rx {
+        timelock.process(sin_val, saw_val, offset);
+        println!(
+            "sin: {:>6.3}  saw: {:>6.3}  offset: {:>6.3}  future_offset: {:>6.3}  dilation: {:>6.3}",
+            sin_val,
+            saw_val,
+            offset,
+            timelock.future_offset(),
+            timelock.time_dilation
+        );
+        let sleep_ms = (100.0 * timelock.time_dilation) as u64;
+        thread::sleep(Duration::from_millis(sleep_ms));
+    }
+
+    let _ = vector_thread.join();
+    let _ = waveform_thread.join();
+}
+
+// --- Main entry point ---
+//
+// This function parses the command line arguments and chooses one of three modes:
+//  • fuse <mountpoint>
+//  • gui
+//  • simulate
+fn main() {
+    let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <mountpoint>  OR  {} gui", args[0], args[0]);
+        eprintln!("Usage:");
+        eprintln!("  {} <mountpoint>   # Run as FUSE filesystem", args[0]);
+        eprintln!("  {} gui            # Launch PySide6 GUI", args[0]);
+        eprintln!("  {} simulate       # Run waveform simulation", args[0]);
         return;
     }
-    let mountpoint = &args[1];
-    if !Path::new(mountpoint).exists() {
-        eprintln!("Mountpoint '{}' does not exist.", mountpoint);
-        return;
+    match args[1].as_str() {
+        "gui" => {
+            if let Err(e) = launch_gui() {
+                eprintln!("Failed to launch GUI: {:?}", e);
+            }
+        }
+        "simulate" => {
+            run_simulation();
+        }
+        mountpoint => {
+            if !Path::new(mountpoint).exists() {
+                eprintln!("Mountpoint '{}' does not exist.", mountpoint);
+                return;
+            }
+            let fs = SyntheticThumbDrive::new();
+            // This call blocks.
+            fuse::mount(fs, mountpoint, &[]).unwrap();
+        }
     }
-    let fs = SyntheticThumbDrive::new();
-    // Mount the filesystem; note that this call blocks.
-    fuse::mount(fs, &mountpoint, &[]).unwrap();
 }
